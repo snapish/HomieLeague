@@ -1,0 +1,34 @@
+:root {
+  color: #0a232a;
+  font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+  font-size: 16px;
+  line-height: 1.45;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-height: 100svh;
+  background:
+    radial-gradient(circle at 15% 15%, rgba(112, 217, 199, 0.42), transparent 44%),
+    radial-gradient(circle at 87% 6%, rgba(139, 206, 232, 0.36), transparent 41%),
+    linear-gradient(160deg, #edf9f7 0%, #e4f2f5 44%, #e9eef8 100%);
+}
+
+#root {
+  min-height: 100svh;
+}
+
+h1,
+h2 {
+  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  letter-spacing: -0.02em;
+  color: #082229;
+}
