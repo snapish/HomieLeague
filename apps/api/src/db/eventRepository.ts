@@ -38,10 +38,11 @@ export class EventManageForbiddenError extends Error {}
 
 export async function getCurrentEventForUser(
   pool: Pool,
-  userId: string
+  userId: string,
+  isAdmin: boolean
 ): Promise<{ team: TeamSummary | null; currentEvent: EventRow | null }> {
   const team = await getTeamSummaryForUser(pool, userId);
-  const currentEvent = await queryCurrentEventRow(pool, team?.id ?? null, userId);
+  const currentEvent = await queryCurrentEventRow(pool, team?.id ?? null, isAdmin);
 
   return {
     team,
@@ -126,7 +127,8 @@ export async function createCurrentEvent(
 
 export async function registerCurrentTeamForCurrentEvent(
   pool: Pool,
-  userId: string
+  userId: string,
+  isAdmin: boolean
 ): Promise<EventRow> {
   const client = await pool.connect();
   try {
@@ -186,7 +188,7 @@ export async function registerCurrentTeamForCurrentEvent(
       [event.id, team.id, userId]
     );
 
-    const refreshed = await queryCurrentEventRow(client, team.id, userId);
+    const refreshed = await queryCurrentEventRow(client, team.id, isAdmin);
 
     if (!refreshed) {
       throw new Error("Event refresh did not return a row");
@@ -211,15 +213,15 @@ export async function registerCurrentTeamForCurrentEvent(
   }
 }
 
-export async function completeCurrentEvent(pool: Pool, userId: string): Promise<EventRow | null> {
+export async function completeCurrentEvent(pool: Pool, isAdmin: boolean): Promise<void> {
   const client = await pool.connect();
 
   try {
     await client.query("BEGIN");
 
-    const eventResult = await client.query<{ id: string; created_by: string }>(
+    const eventResult = await client.query<{ id: string }>(
       `
-        SELECT id, created_by
+        SELECT id
         FROM events
         WHERE status <> 'completed'
         ORDER BY created_at DESC
@@ -232,8 +234,8 @@ export async function completeCurrentEvent(pool: Pool, userId: string): Promise<
       throw new EventNotFoundError("Event not found");
     }
 
-    if (currentEvent.created_by !== userId) {
-      throw new EventManageForbiddenError("Only the event creator can complete the current event");
+    if (!isAdmin) {
+      throw new EventManageForbiddenError("Only the admin account can complete the current event");
     }
 
     await client.query(
@@ -246,7 +248,6 @@ export async function completeCurrentEvent(pool: Pool, userId: string): Promise<
     );
 
     await client.query("COMMIT");
-    return null;
   } catch (error: unknown) {
     await client.query("ROLLBACK");
     if (error instanceof EventNotFoundError || error instanceof EventManageForbiddenError) {
@@ -261,7 +262,7 @@ export async function completeCurrentEvent(pool: Pool, userId: string): Promise<
 async function queryCurrentEventRow(
   poolLike: Pool | PoolClient,
   teamId: string | null,
-  userId: string
+  isAdmin: boolean
 ): Promise<EventRow | null> {
   const result = await poolLike.query<EventRow>(
     `
@@ -276,7 +277,7 @@ async function queryCurrentEventRow(
         e.status,
         COUNT(er.team_id)::int AS registration_count,
         COALESCE(your_registration.team_id IS NOT NULL, false) AS is_registered_for_your_team,
-        (e.created_by = $2) AS can_manage_current_event,
+        ($2::boolean) AS can_manage_current_event,
         CASE
           WHEN $1::uuid IS NULL THEN false
           WHEN team_state.member_count = 5
@@ -305,7 +306,7 @@ async function queryCurrentEventRow(
       ORDER BY e.created_at DESC
       LIMIT 1
     `,
-    [teamId, userId]
+    [teamId, isAdmin]
   );
 
   return result.rows[0] ?? null;

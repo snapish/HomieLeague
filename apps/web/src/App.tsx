@@ -25,6 +25,7 @@ import type {
   TransferTeamAdminRequest
 } from "@homieleague/shared";
 import { AppShellNav } from "./components/AppShellNav";
+import { AdminPanel } from "./components/AdminPanel";
 import { AuthPanels } from "./components/AuthPanels";
 import { EventsPanel } from "./components/EventsPanel";
 import { PlayerDashboardOverview } from "./components/PlayerDashboardOverview";
@@ -159,6 +160,11 @@ function App() {
     }
 
     if (activeUser && route === "auth") {
+      navigateTo("app-overview");
+      return;
+    }
+
+    if (activeUser && route === "app-admin" && !activeUser.isAdmin) {
       navigateTo("app-overview");
     }
   }, [activeUser, isCheckingSession, route]);
@@ -683,8 +689,7 @@ function App() {
 
       const payload = (await response.json()) as ApiSuccessResponse | ApiErrorResponse;
       if (!response.ok || !payload.ok) {
-        const message = payload.ok ? payload.message : payload.message;
-        setSessionStatus({ kind: "error", message });
+        setSessionStatus({ kind: "error", message: payload.message });
         return;
       }
     } finally {
@@ -734,7 +739,7 @@ function App() {
         />
       ) : (
         <section className="app-shell" aria-label="Authenticated Application">
-          <AppShellNav route={route} onNavigate={navigateTo} />
+          <AppShellNav route={route} isAdmin={activeUser?.isAdmin ?? false} onNavigate={navigateTo} />
 
           <article className="shell-content">
             {route === "app-overview" && (
@@ -784,16 +789,24 @@ function App() {
                 team={playerTeam}
                 currentEvent={currentEvent}
                 isLoadingEvents={isLoadingEvents}
-                isCreatingEvent={isCreatingEvent}
                 isRegisteringCurrentEvent={isRegisteringCurrentEvent}
+                eventsStatus={eventsStatus}
+                onRegisterCurrentEvent={() => {
+                  void handleRegisterTeamForCurrentEvent();
+                }}
+              />
+            )}
+
+            {route === "app-admin" && (
+              <AdminPanel
+                activeUser={activeUser}
+                currentEvent={currentEvent}
+                isCreatingEvent={isCreatingEvent}
                 isCompletingCurrentEvent={isCompletingCurrentEvent}
                 eventsStatus={eventsStatus}
                 createEventForm={createEventForm}
                 onCreateEventChange={setCreateEventForm}
                 onCreateEventSubmit={handleCreateEventSubmit}
-                onRegisterCurrentEvent={() => {
-                  void handleRegisterTeamForCurrentEvent();
-                }}
                 onCompleteCurrentEvent={() => {
                   void handleCompleteCurrentEvent();
                 }}

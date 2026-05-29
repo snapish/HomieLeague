@@ -80,6 +80,10 @@ const app = express();
 const port = Number(process.env.PORT ?? 3000);
 const webOrigin = process.env.WEB_ORIGIN ?? "http://localhost:5173";
 const sessionLifetimeHours = Number(process.env.SESSION_LIFETIME_HOURS ?? 24);
+const adminEmail = requireEnv("ADMIN_EMAIL").trim().toLowerCase();
+const adminUsername = requireEnv("ADMIN_USERNAME").trim();
+const adminSteamId = requireEnv("ADMIN_STEAM_ID").trim();
+const adminPassword = requireEnv("ADMIN_PASSWORD").trim();
 
 const signupSchema = z
   .object({
@@ -197,12 +201,7 @@ app.post("/api/auth/signup", async (req, res) => {
     const payload: AuthSuccessResponse = {
       ok: true,
       message: "Account created successfully",
-      user: {
-        id: user.id,
-        email: user.email,
-        username: user.username,
-        steamId: user.steam_id
-      },
+      user: mapAuthenticatedUser(user),
       sessionToken,
       expiresAt: expiresAt.toISOString()
     };
@@ -269,12 +268,7 @@ app.post("/api/auth/login", async (req, res) => {
     const payload: AuthSuccessResponse = {
       ok: true,
       message: "Logged in successfully",
-      user: {
-        id: user.id,
-        email: user.email,
-        username: user.username,
-        steamId: user.steam_id
-      },
+      user: mapAuthenticatedUser(user),
       sessionToken,
       expiresAt: expiresAt.toISOString()
     };
@@ -345,12 +339,7 @@ app.get("/api/auth/me", async (req, res) => {
     const payload: AuthSessionResponse = {
       ok: true,
       message: "Session is valid",
-      user: {
-        id: sessionUser.user_id,
-        email: sessionUser.email,
-        username: sessionUser.username,
-        steamId: sessionUser.steam_id
-      }
+      user: mapAuthenticatedUser(sessionUser)
     };
     res.status(200).json(payload);
   } catch {
@@ -380,12 +369,7 @@ app.get("/api/player/dashboard", async (req, res) => {
     const payload: PlayerDashboardResponse = {
       ok: true,
       message: "Dashboard loaded",
-      user: {
-        id: sessionUser.user_id,
-        email: sessionUser.email,
-        username: sessionUser.username,
-        steamId: sessionUser.steam_id
-      },
+      user: mapAuthenticatedUser(sessionUser),
       team: mapTeamSummary(teamSummary)
     };
 
@@ -776,7 +760,7 @@ app.get("/api/events", async (req, res) => {
     }
 
     const pool = getDbPool();
-    const result = await getCurrentEventForUser(pool, sessionUser.user_id);
+    const result = await getCurrentEventForUser(pool, sessionUser.user_id, sessionUser.isAdmin);
     const payload: CurrentEventResponse = {
       ok: true,
       message: "Current event loaded",
@@ -817,18 +801,18 @@ app.post("/api/events", async (req, res) => {
   }
 
   try {
-    const sessionUser = await requireSessionUser(req.header("authorization"));
-    if (!sessionUser) {
+    const adminGuard = await requireAdminSessionUser(req.header("authorization"));
+    if (!adminGuard.ok) {
       const payload: ApiErrorResponse = {
         ok: false,
-        message: "Invalid or expired session"
+        message: adminGuard.message
       };
-      res.status(401).json(payload);
+      res.status(adminGuard.status).json(payload);
       return;
     }
 
     const pool = getDbPool();
-    const createdEvent = await createCurrentEvent(pool, request, sessionUser.user_id);
+    const createdEvent = await createCurrentEvent(pool, request, adminGuard.sessionUser.user_id);
     const payload: CreateEventResponse = {
       ok: true,
       message: "Current event created",
@@ -888,7 +872,11 @@ app.post("/api/events/register", async (req, res) => {
     }
 
     const pool = getDbPool();
-    const updatedEvent = await registerCurrentTeamForCurrentEvent(pool, sessionUser.user_id);
+    const updatedEvent = await registerCurrentTeamForCurrentEvent(
+      pool,
+      sessionUser.user_id,
+      sessionUser.isAdmin
+    );
     const payload: RegisterEventResponse = {
       ok: true,
       message: "Team registered for current event",
@@ -963,13 +951,13 @@ app.post("/api/events/current/complete", async (req, res) => {
   }
 
   try {
-    const sessionUser = await requireSessionUser(req.header("authorization"));
-    if (!sessionUser) {
+    const adminGuard = await requireAdminSessionUser(req.header("authorization"));
+    if (!adminGuard.ok) {
       const payload: ApiErrorResponse = {
         ok: false,
-        message: "Invalid or expired session"
+        message: adminGuard.message
       };
-      res.status(401).json(payload);
+      res.status(adminGuard.status).json(payload);
       return;
     }
 
@@ -984,8 +972,12 @@ app.post("/api/events/current/complete", async (req, res) => {
     }
 
     const pool = getDbPool();
-    await completeCurrentEvent(pool, sessionUser.user_id);
-    const refreshed = await getCurrentEventForUser(pool, sessionUser.user_id);
+    await completeCurrentEvent(pool, adminGuard.sessionUser.isAdmin);
+    const refreshed = await getCurrentEventForUser(
+      pool,
+      adminGuard.sessionUser.user_id,
+      adminGuard.sessionUser.isAdmin
+    );
 
     const payload: CompleteCurrentEventResponse = {
       ok: true,
@@ -1006,7 +998,7 @@ app.post("/api/events/current/complete", async (req, res) => {
     if (error instanceof EventManageForbiddenError) {
       const payload: ApiErrorResponse = {
         ok: false,
-        message: "Only the event creator can complete the current event"
+        message: "Only the admin account can complete the current event"
       };
       res.status(403).json(payload);
       return;
@@ -1028,9 +1020,7 @@ app.use((_req, res) => {
   res.status(404).json(payload);
 });
 
-app.listen(port, () => {
-  console.log(`API listening on port ${port}`);
-});
+void startServer();
 
 function extractBearerToken(headerValue: string | undefined): string | null {
   if (!headerValue) {
@@ -1047,7 +1037,9 @@ function extractBearerToken(headerValue: string | undefined): string | null {
 
 async function requireSessionUser(
   authorizationHeader: string | undefined
-): Promise<Awaited<ReturnType<typeof findSessionUserByTokenHash>> | null> {
+): Promise<
+  (NonNullable<Awaited<ReturnType<typeof findSessionUserByTokenHash>>> & { isAdmin: boolean }) | null
+> {
   const token = extractBearerToken(authorizationHeader);
   if (!token) {
     return null;
@@ -1055,7 +1047,45 @@ async function requireSessionUser(
 
   const pool = getDbPool();
   const tokenHash = hashSessionToken(token);
-  return findSessionUserByTokenHash(pool, tokenHash);
+  const sessionUser = await findSessionUserByTokenHash(pool, tokenHash);
+  if (!sessionUser) {
+    return null;
+  }
+
+  return {
+    ...sessionUser,
+    isAdmin: isAdminIdentity(sessionUser.email)
+  };
+}
+
+type AdminSessionGuardResult =
+  | { ok: true; sessionUser: NonNullable<Awaited<ReturnType<typeof requireSessionUser>>> }
+  | { ok: false; status: 401 | 403; message: string };
+
+async function requireAdminSessionUser(
+  authorizationHeader: string | undefined
+): Promise<AdminSessionGuardResult> {
+  const sessionUser = await requireSessionUser(authorizationHeader);
+  if (!sessionUser) {
+    return {
+      ok: false,
+      status: 401,
+      message: "Invalid or expired session"
+    };
+  }
+
+  if (!sessionUser.isAdmin) {
+    return {
+      ok: false,
+      status: 403,
+      message: "Only the admin account can manage events"
+    };
+  }
+
+  return {
+    ok: true,
+    sessionUser
+  };
 }
 
 function mapTeamSummary(
@@ -1121,4 +1151,81 @@ function requireTeamSummary(
   }
 
   return mapped;
+}
+
+function mapAuthenticatedUser(user: {
+  id?: string;
+  user_id?: string;
+  email: string;
+  username: string;
+  steam_id: string;
+}): AuthSessionResponse["user"] {
+  const id = user.id ?? user.user_id;
+  if (!id) {
+    throw new Error("User id missing");
+  }
+
+  return {
+    id,
+    email: user.email,
+    username: user.username,
+    steamId: user.steam_id,
+    isAdmin: isAdminIdentity(user.email)
+  };
+}
+
+function isAdminIdentity(email: string): boolean {
+  return email.trim().toLowerCase() === adminEmail;
+}
+
+function requireEnv(name: string): string {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required environment variable: ${name}`);
+  }
+
+  return value;
+}
+
+async function ensureAdminAccount(): Promise<void> {
+  const pool = getDbPool();
+  const existingAdmin = await findUserByIdentifier(pool, adminEmail);
+  if (existingAdmin) {
+    return;
+  }
+
+  const passwordHash = await hashPassword(adminPassword);
+  try {
+    await createUser(pool, {
+      email: adminEmail,
+      username: adminUsername,
+      steamId: adminSteamId,
+      passwordHash
+    });
+
+    console.log(`Admin account created for ${adminEmail}`);
+  } catch (error: unknown) {
+    if (error instanceof DuplicateUserError) {
+      const recheck = await findUserByIdentifier(pool, adminEmail);
+      if (recheck) {
+        return;
+      }
+      throw new Error(
+        "Admin account bootstrap failed due to conflicting username. Update ADMIN_USERNAME and restart."
+      );
+    }
+    throw error;
+  }
+}
+
+async function startServer(): Promise<void> {
+  try {
+    await ensureAdminAccount();
+  } catch (error) {
+    console.warn("Unable to ensure admin account at startup", error);
+  }
+
+  app.listen(port, () => {
+    console.log(`API listening on port ${port}`);
+  });
 }

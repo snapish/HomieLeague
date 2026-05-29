@@ -22,6 +22,12 @@ Variables:
 - `WEB_ORIGIN`
 - `SESSION_LIFETIME_HOURS`
 - `PORT`
+- `ADMIN_EMAIL`
+- `ADMIN_USERNAME`
+- `ADMIN_STEAM_ID`
+- `ADMIN_PASSWORD`
+
+These admin variables are required. If the admin account does not exist, the API creates it at startup using them.
 
 ## 3. Create database (one-time)
 

@@ -3,4 +3,4 @@ export type RequestStatus = {
   message: string;
 };
 
-export type RouteKey = "auth" | "app-overview" | "app-team" | "app-events";
+export type RouteKey = "auth" | "app-overview" | "app-team" | "app-events" | "app-admin";

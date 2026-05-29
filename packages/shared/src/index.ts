@@ -43,6 +43,7 @@ export interface AuthenticatedUser {
   email: string;
   username: string;
   steamId: string;
+  isAdmin: boolean;
 }
 
 export interface AuthSuccessResponse extends ApiSuccessResponse {
