@@ -116,6 +116,7 @@ export interface EventSummary {
   isRegisteredForYourTeam: boolean;
   canRegisterYourTeam: boolean;
   canManageCurrentEvent: boolean;
+  canStartCurrentEvent: boolean;
 }
 
 export interface CurrentEventResponse extends ApiSuccessResponse {
@@ -144,8 +145,17 @@ export interface CompleteCurrentEventRequest {
   confirm: true;
 }
 
+export interface StartCurrentEventRequest {
+  confirm: true;
+}
+
 export interface CompleteCurrentEventResponse extends ApiSuccessResponse {
   currentEvent: EventSummary | null;
+}
+
+export interface StartCurrentEventResponse extends ApiSuccessResponse {
+  currentEvent: EventSummary | null;
+  createdMatches: number;
 }
 
 export interface RegisterEventResponse extends ApiSuccessResponse {

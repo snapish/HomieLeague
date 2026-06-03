@@ -6,11 +6,13 @@ interface AdminPanelProps {
   activeUser: AuthenticatedUser | null;
   currentEvent: EventSummary | null;
   isCreatingEvent: boolean;
+  isStartingCurrentEvent: boolean;
   isCompletingCurrentEvent: boolean;
   eventsStatus: RequestStatus;
   createEventForm: CreateEventRequest;
   onCreateEventChange: (next: CreateEventRequest) => void;
   onCreateEventSubmit: (event: FormEvent<HTMLFormElement>) => Promise<void>;
+  onStartCurrentEvent: () => void;
   onCompleteCurrentEvent: () => void;
 }
 
@@ -18,11 +20,13 @@ export function AdminPanel({
   activeUser,
   currentEvent,
   isCreatingEvent,
+  isStartingCurrentEvent,
   isCompletingCurrentEvent,
   eventsStatus,
   createEventForm,
   onCreateEventChange,
   onCreateEventSubmit,
+  onStartCurrentEvent,
   onCompleteCurrentEvent
 }: AdminPanelProps) {
   return (
@@ -147,7 +151,15 @@ export function AdminPanel({
               <button
                 type="button"
                 className="secondary-btn"
-                disabled={isCompletingCurrentEvent}
+                disabled={!currentEvent.canStartCurrentEvent || isStartingCurrentEvent || isCompletingCurrentEvent}
+                onClick={onStartCurrentEvent}
+              >
+                {isStartingCurrentEvent ? "Starting..." : "Start current event"}
+              </button>
+              <button
+                type="button"
+                className="secondary-btn"
+                disabled={isCompletingCurrentEvent || currentEvent.status !== "in_progress"}
                 onClick={onCompleteCurrentEvent}
               >
                 {isCompletingCurrentEvent ? "Completing..." : "Complete current event"}

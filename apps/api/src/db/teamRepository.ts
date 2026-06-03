@@ -36,6 +36,7 @@ export class NotOnTeamError extends Error {}
 export class TeamAdminRequiredError extends Error {}
 export class TeamMemberNotFoundError extends Error {}
 export class CannotRemoveTeamAdminError extends Error {}
+export class TeamRosterLockedError extends Error {}
 
 export async function getTeamSummaryForUser(pool: Pool, userId: string): Promise<TeamSummary | null> {
   const client = await pool.connect();
@@ -152,6 +153,9 @@ export async function joinTeamByInviteCode(
         [targetTeam.id, userId]
       );
     } catch (error: unknown) {
+      if (isTeamRosterLockedViolation(error)) {
+        throw new TeamRosterLockedError("Team roster is locked for the active event");
+      }
       if (isCheckViolation(error)) {
         throw new TeamFullError("Team has reached the member limit");
       }
@@ -173,7 +177,8 @@ export async function joinTeamByInviteCode(
     if (
       error instanceof TeamNotFoundError ||
       error instanceof TeamFullError ||
-      error instanceof AlreadyOnTeamError
+      error instanceof AlreadyOnTeamError ||
+      error instanceof TeamRosterLockedError
     ) {
       throw error;
     }
@@ -219,13 +224,20 @@ export async function leaveCurrentTeam(pool: Pool, userId: string): Promise<void
       throw new AdminTransferRequiredError("Admin must transfer ownership before leaving");
     }
 
-    await client.query(
-      `
-        DELETE FROM team_members
-        WHERE team_id = $1 AND user_id = $2
-      `,
-      [membership.team_id, userId]
-    );
+    try {
+      await client.query(
+        `
+          DELETE FROM team_members
+          WHERE team_id = $1 AND user_id = $2
+        `,
+        [membership.team_id, userId]
+      );
+    } catch (error: unknown) {
+      if (isTeamRosterLockedViolation(error)) {
+        throw new TeamRosterLockedError("Team roster is locked for the active event");
+      }
+      throw error;
+    }
 
     if (currentCount === 1) {
       await client.query(
@@ -240,7 +252,11 @@ export async function leaveCurrentTeam(pool: Pool, userId: string): Promise<void
     await client.query("COMMIT");
   } catch (error: unknown) {
     await client.query("ROLLBACK");
-    if (error instanceof AdminTransferRequiredError || error instanceof NotOnTeamError) {
+    if (
+      error instanceof AdminTransferRequiredError ||
+      error instanceof NotOnTeamError ||
+      error instanceof TeamRosterLockedError
+    ) {
       throw error;
     }
     throw error;
@@ -330,25 +346,32 @@ export async function transferTeamAdmin(
       throw new TeamMemberNotFoundError("Target member not found");
     }
 
-    await client.query(
-      `
-        UPDATE team_members
-        SET role = 'member'
-        WHERE team_id = $1
-          AND user_id = $2
-      `,
-      [membership.team_id, userId]
-    );
+    try {
+      await client.query(
+        `
+          UPDATE team_members
+          SET role = 'member'
+          WHERE team_id = $1
+            AND user_id = $2
+        `,
+        [membership.team_id, userId]
+      );
 
-    await client.query(
-      `
-        UPDATE team_members
-        SET role = 'admin'
-        WHERE team_id = $1
-          AND user_id = $2
-      `,
-      [membership.team_id, newAdminUserId]
-    );
+      await client.query(
+        `
+          UPDATE team_members
+          SET role = 'admin'
+          WHERE team_id = $1
+            AND user_id = $2
+        `,
+        [membership.team_id, newAdminUserId]
+      );
+    } catch (error: unknown) {
+      if (isTeamRosterLockedViolation(error)) {
+        throw new TeamRosterLockedError("Team roster is locked for the active event");
+      }
+      throw error;
+    }
 
     const summary = await getTeamSummaryForUserWithClient(client, userId);
     if (!summary) {
@@ -362,7 +385,8 @@ export async function transferTeamAdmin(
     if (
       error instanceof TeamAdminRequiredError ||
       error instanceof NotOnTeamError ||
-      error instanceof TeamMemberNotFoundError
+      error instanceof TeamMemberNotFoundError ||
+      error instanceof TeamRosterLockedError
     ) {
       throw error;
     }
@@ -403,14 +427,21 @@ export async function removeTeamMember(
       throw new CannotRemoveTeamAdminError("Cannot remove the team admin");
     }
 
-    await client.query(
-      `
-        DELETE FROM team_members
-        WHERE team_id = $1
-          AND user_id = $2
-      `,
-      [membership.team_id, memberUserId]
-    );
+    try {
+      await client.query(
+        `
+          DELETE FROM team_members
+          WHERE team_id = $1
+            AND user_id = $2
+        `,
+        [membership.team_id, memberUserId]
+      );
+    } catch (error: unknown) {
+      if (isTeamRosterLockedViolation(error)) {
+        throw new TeamRosterLockedError("Team roster is locked for the active event");
+      }
+      throw error;
+    }
 
     const summary = await getTeamSummaryForUserWithClient(client, userId);
     if (!summary) {
@@ -425,7 +456,8 @@ export async function removeTeamMember(
       error instanceof TeamAdminRequiredError ||
       error instanceof NotOnTeamError ||
       error instanceof TeamMemberNotFoundError ||
-      error instanceof CannotRemoveTeamAdminError
+      error instanceof CannotRemoveTeamAdminError ||
+      error instanceof TeamRosterLockedError
     ) {
       throw error;
     }
@@ -539,4 +571,15 @@ function isDuplicateViolation(
 
 function isCheckViolation(error: unknown): error is { code: string } {
   return typeof error === "object" && error !== null && "code" in error && error.code === "23514";
+}
+
+function isTeamRosterLockedViolation(error: unknown): boolean {
+  return (
+    isCheckViolation(error) &&
+    typeof error === "object" &&
+    error !== null &&
+    "message" in error &&
+    typeof error.message === "string" &&
+    error.message.toLowerCase().includes("team roster is locked")
+  );
 }

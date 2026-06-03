@@ -17,6 +17,7 @@ export interface EventRow {
   is_registered_for_your_team: boolean;
   can_register_your_team: boolean;
   can_manage_current_event: boolean;
+  can_start_current_event: boolean;
 }
 
 export interface CreateEventInput {
@@ -35,6 +36,8 @@ export class EventTeamNotReadyError extends Error {}
 export class EventTeamNotEligibleError extends Error {}
 export class EventTeamAlreadyRegisteredError extends Error {}
 export class EventManageForbiddenError extends Error {}
+export class EventStartStateError extends Error {}
+export class EventInsufficientTeamsError extends Error {}
 
 export async function getCurrentEventForUser(
   pool: Pool,
@@ -95,7 +98,8 @@ export async function createCurrentEvent(
           0::int AS registration_count,
           false AS is_registered_for_your_team,
           true AS can_register_your_team,
-          true AS can_manage_current_event
+            true AS can_manage_current_event,
+            true AS can_start_current_event
       `,
       [
         input.title,
@@ -259,6 +263,107 @@ export async function completeCurrentEvent(pool: Pool, isAdmin: boolean): Promis
   }
 }
 
+export async function startCurrentEvent(
+  pool: Pool,
+  isAdmin: boolean
+): Promise<{ createdMatches: number }> {
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    const eventResult = await client.query<{ id: string; status: EventStatus }>(
+      `
+        SELECT id, status
+        FROM events
+        WHERE status <> 'completed'
+        ORDER BY created_at DESC
+        LIMIT 1
+      `
+    );
+
+    const currentEvent = eventResult.rows[0];
+    if (!currentEvent) {
+      throw new EventNotFoundError("Event not found");
+    }
+
+    if (!isAdmin) {
+      throw new EventManageForbiddenError("Only the admin account can start the current event");
+    }
+
+    if (currentEvent.status !== "registration_open") {
+      throw new EventStartStateError("Current event is not in a startable state");
+    }
+
+    const registrationsResult = await client.query<{ team_id: string }>(
+      `
+        SELECT team_id
+        FROM event_registrations
+        WHERE event_id = $1
+        ORDER BY created_at ASC, team_id ASC
+      `,
+      [currentEvent.id]
+    );
+
+    const registeredTeamIds = registrationsResult.rows.map((row) => row.team_id);
+    if (registeredTeamIds.length < 2) {
+      throw new EventInsufficientTeamsError("At least two teams are required to start the current event");
+    }
+
+    const bracketSize = nextPowerOfTwo(registeredTeamIds.length);
+    const paddedTeamIds = [
+      ...registeredTeamIds,
+      ...Array.from({ length: bracketSize - registeredTeamIds.length }, () => null as string | null)
+    ];
+    const firstRoundMatchCount = bracketSize / 2;
+
+    for (let index = 0; index < firstRoundMatchCount; index += 1) {
+      const teamAId = paddedTeamIds[index * 2] ?? null;
+      const teamBId = paddedTeamIds[index * 2 + 1] ?? null;
+
+      await client.query(
+        `
+          INSERT INTO event_matches (
+            event_id,
+            round_number,
+            slot_number,
+            team_a_id,
+            team_b_id,
+            status
+          )
+          VALUES ($1, 1, $2, $3, $4, 'pending')
+        `,
+        [currentEvent.id, index + 1, teamAId, teamBId]
+      );
+    }
+
+    await client.query(
+      `
+        UPDATE events
+        SET status = 'in_progress', updated_at = NOW()
+        WHERE id = $1
+      `,
+      [currentEvent.id]
+    );
+
+    await client.query("COMMIT");
+    return { createdMatches: firstRoundMatchCount };
+  } catch (error: unknown) {
+    await client.query("ROLLBACK");
+    if (
+      error instanceof EventNotFoundError ||
+      error instanceof EventManageForbiddenError ||
+      error instanceof EventStartStateError ||
+      error instanceof EventInsufficientTeamsError
+    ) {
+      throw error;
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function queryCurrentEventRow(
   poolLike: Pool | PoolClient,
   teamId: string | null,
@@ -278,6 +383,14 @@ async function queryCurrentEventRow(
         COUNT(er.team_id)::int AS registration_count,
         COALESCE(your_registration.team_id IS NOT NULL, false) AS is_registered_for_your_team,
         ($2::boolean) AS can_manage_current_event,
+        CASE
+          WHEN $2::boolean
+            AND e.status = 'registration_open'
+            AND e.registration_opens_at <= NOW()
+            AND e.registration_closes_at >= NOW()
+          THEN true
+          ELSE false
+        END AS can_start_current_event,
         CASE
           WHEN $1::uuid IS NULL THEN false
           WHEN team_state.member_count = 5
@@ -316,4 +429,13 @@ function isDuplicateViolation(
   error: unknown
 ): error is { code: string; constraint?: string } {
   return typeof error === "object" && error !== null && "code" in error && error.code === "23505";
+}
+
+function nextPowerOfTwo(value: number): number {
+  let candidate = 1;
+  while (candidate < value) {
+    candidate *= 2;
+  }
+
+  return candidate;
 }

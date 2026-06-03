@@ -8,6 +8,8 @@ import type {
   ApiErrorResponse,
   CompleteCurrentEventRequest,
   CompleteCurrentEventResponse,
+  StartCurrentEventRequest,
+  StartCurrentEventResponse,
   CurrentEventResponse,
   CreateEventRequest,
   CreateTeamRequest,
@@ -50,18 +52,22 @@ import {
   TeamFullError,
   TeamMemberNotFoundError,
   TeamNotFoundError,
+  TeamRosterLockedError,
   transferTeamAdmin
 } from "./db/teamRepository.js";
 import {
   ActiveEventExistsError,
   completeCurrentEvent,
   createCurrentEvent,
+  EventInsufficientTeamsError,
   EventManageForbiddenError,
   EventNotFoundError,
   EventRegistrationClosedError,
+  EventStartStateError,
   EventTeamAlreadyRegisteredError,
   EventTeamNotEligibleError,
   EventTeamNotReadyError,
+  startCurrentEvent,
   type EventRow,
   getCurrentEventForUser,
   registerCurrentTeamForCurrentEvent
@@ -143,6 +149,12 @@ const registerEventSchema = z
   .strict();
 
 const completeCurrentEventSchema = z
+  .object({
+    confirm: z.literal(true)
+  })
+  .strict();
+
+const startCurrentEventSchema = z
   .object({
     confirm: z.literal(true)
   })
@@ -486,6 +498,15 @@ app.post("/api/player/team/join", async (req, res) => {
       return;
     }
 
+    if (error instanceof TeamRosterLockedError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Team roster is locked for the active event"
+      };
+      res.status(409).json(payload);
+      return;
+    }
+
     if (error instanceof AlreadyOnTeamError) {
       const payload: ApiErrorResponse = {
         ok: false,
@@ -605,6 +626,15 @@ app.post("/api/player/team/admin/transfer", async (req, res) => {
       return;
     }
 
+    if (error instanceof TeamRosterLockedError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Team roster is locked for the active event"
+      };
+      res.status(409).json(payload);
+      return;
+    }
+
     if (error instanceof NotOnTeamError) {
       const payload: ApiErrorResponse = {
         ok: false,
@@ -684,6 +714,15 @@ app.post("/api/player/team/members/remove", async (req, res) => {
       return;
     }
 
+    if (error instanceof TeamRosterLockedError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Team roster is locked for the active event"
+      };
+      res.status(409).json(payload);
+      return;
+    }
+
     if (error instanceof NotOnTeamError) {
       const payload: ApiErrorResponse = {
         ok: false,
@@ -736,6 +775,15 @@ app.post("/api/player/team/leave", async (req, res) => {
         message: "You are not on a team"
       };
       res.status(404).json(payload);
+      return;
+    }
+
+    if (error instanceof TeamRosterLockedError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Team roster is locked for the active event"
+      };
+      res.status(409).json(payload);
       return;
     }
 
@@ -933,6 +981,99 @@ app.post("/api/events/register", async (req, res) => {
     const payload: ApiErrorResponse = {
       ok: false,
       message: "Unable to register team for event"
+    };
+    res.status(500).json(payload);
+  }
+});
+
+app.post("/api/events/current/start", async (req, res) => {
+  const parsed = startCurrentEventSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Invalid current event start payload",
+      issues: parsed.error.issues.map((issue) => issue.path.join(".") || issue.message)
+    };
+    res.status(400).json(payload);
+    return;
+  }
+
+  try {
+    const adminGuard = await requireAdminSessionUser(req.header("authorization"));
+    if (!adminGuard.ok) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: adminGuard.message
+      };
+      res.status(adminGuard.status).json(payload);
+      return;
+    }
+
+    const request: StartCurrentEventRequest = parsed.data;
+    if (!request.confirm) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Start confirmation is required"
+      };
+      res.status(400).json(payload);
+      return;
+    }
+
+    const pool = getDbPool();
+    const result = await startCurrentEvent(pool, adminGuard.sessionUser.isAdmin);
+    const refreshed = await getCurrentEventForUser(
+      pool,
+      adminGuard.sessionUser.user_id,
+      adminGuard.sessionUser.isAdmin
+    );
+
+    const payload: StartCurrentEventResponse = {
+      ok: true,
+      message: `Current event started. ${result.createdMatches} first-round match${result.createdMatches === 1 ? "" : "es"} created.`,
+      currentEvent: refreshed.currentEvent ? mapEventRow(refreshed.currentEvent) : null,
+      createdMatches: result.createdMatches
+    };
+    res.status(200).json(payload);
+  } catch (error: unknown) {
+    if (error instanceof EventNotFoundError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "No active event to start"
+      };
+      res.status(404).json(payload);
+      return;
+    }
+
+    if (error instanceof EventStartStateError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Current event has already started or cannot be started"
+      };
+      res.status(409).json(payload);
+      return;
+    }
+
+    if (error instanceof EventInsufficientTeamsError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "At least two registered teams are required before starting"
+      };
+      res.status(409).json(payload);
+      return;
+    }
+
+    if (error instanceof EventManageForbiddenError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Only the admin account can start the current event"
+      };
+      res.status(403).json(payload);
+      return;
+    }
+
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Unable to start current event"
     };
     res.status(500).json(payload);
   }
@@ -1138,7 +1279,8 @@ function mapEventRow(row: EventRow): EventSummary {
     registrationCount: row.registration_count,
     isRegisteredForYourTeam: row.is_registered_for_your_team,
     canRegisterYourTeam: row.can_register_your_team,
-    canManageCurrentEvent: row.can_manage_current_event
+    canManageCurrentEvent: row.can_manage_current_event,
+    canStartCurrentEvent: row.can_start_current_event
   };
 }
 

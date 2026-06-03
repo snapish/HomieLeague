@@ -8,6 +8,8 @@ import type {
   AuthenticatedUser,
   CompleteCurrentEventRequest,
   CompleteCurrentEventResponse,
+  StartCurrentEventRequest,
+  StartCurrentEventResponse,
   CreateEventRequest,
   CreateEventResponse,
   CurrentEventResponse,
@@ -91,6 +93,7 @@ function App() {
   const [currentEvent, setCurrentEvent] = useState<EventSummary | null>(null);
   const [isLoadingEvents, setIsLoadingEvents] = useState(true);
   const [isCreatingEvent, setIsCreatingEvent] = useState(false);
+  const [isStartingCurrentEvent, setIsStartingCurrentEvent] = useState(false);
   const [isRegisteringCurrentEvent, setIsRegisteringCurrentEvent] = useState(false);
   const [isCompletingCurrentEvent, setIsCompletingCurrentEvent] = useState(false);
   const [eventsStatus, setEventsStatus] = useState<RequestStatus>({ kind: "idle", message: "" });
@@ -479,6 +482,51 @@ function App() {
     }
   }
 
+  async function handleStartCurrentEvent() {
+    if (!sessionToken) {
+      setEventsStatus({ kind: "error", message: "Missing session. Please log in again." });
+      return;
+    }
+
+    if (!window.confirm("Start the current event? Registration will lock and opening matches will be generated.")) {
+      return;
+    }
+
+    setIsStartingCurrentEvent(true);
+
+    try {
+      const request: StartCurrentEventRequest = { confirm: true };
+      const response = await fetch(`${API_BASE_URL}/api/events/current/start`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${sessionToken}`
+        },
+        body: JSON.stringify(request)
+      });
+
+      const payload = (await response.json()) as StartCurrentEventResponse | ApiErrorResponse;
+      if (!response.ok || !payload.ok) {
+        if (response.status === 401) {
+          clearSessionState();
+          setSessionStatus({ kind: "error", message: "Session expired. Please log in again." });
+          navigateTo("auth");
+          return;
+        }
+
+        setEventsStatus({ kind: "error", message: payload.message });
+        return;
+      }
+
+      setEventsStatus({ kind: "success", message: payload.message });
+      setCurrentEvent(payload.currentEvent);
+    } catch {
+      setEventsStatus({ kind: "error", message: "Could not start current event." });
+    } finally {
+      setIsStartingCurrentEvent(false);
+    }
+  }
+
   async function handleRotateInvite() {
     if (!sessionToken) {
       setDashboardStatus({ kind: "error", message: "Missing session. Please log in again." });
@@ -802,11 +850,15 @@ function App() {
                 activeUser={activeUser}
                 currentEvent={currentEvent}
                 isCreatingEvent={isCreatingEvent}
+                isStartingCurrentEvent={isStartingCurrentEvent}
                 isCompletingCurrentEvent={isCompletingCurrentEvent}
                 eventsStatus={eventsStatus}
                 createEventForm={createEventForm}
                 onCreateEventChange={setCreateEventForm}
                 onCreateEventSubmit={handleCreateEventSubmit}
+                onStartCurrentEvent={() => {
+                  void handleStartCurrentEvent();
+                }}
                 onCompleteCurrentEvent={() => {
                   void handleCompleteCurrentEvent();
                 }}
