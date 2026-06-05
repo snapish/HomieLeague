@@ -1,4 +1,5 @@
 import type { Pool, PoolClient } from "pg";
+import type { MatchScheduleProposalStatus, MatchStatus } from "@homieleague/shared";
 import type { TeamSummary } from "./teamRepository.js";
 import { getTeamSummaryForUser } from "./teamRepository.js";
 
@@ -20,6 +21,34 @@ export interface EventRow {
   can_start_current_event: boolean;
 }
 
+export interface EventMatchRow {
+  id: string;
+  round_number: number;
+  slot_number: number;
+  status: MatchStatus;
+  team_a_id: string | null;
+  team_a_name: string | null;
+  team_b_id: string | null;
+  team_b_name: string | null;
+  scheduled_start_at: string | null;
+  winner_team_id: string | null;
+  can_manage_lifecycle: boolean;
+  can_transition_to_scheduled: boolean;
+  can_transition_to_in_progress: boolean;
+  can_propose_schedule: boolean;
+  can_respond_to_schedule_proposal: boolean;
+  can_report_result: boolean;
+  your_reported_winner_team_id: string | null;
+  is_awaiting_opponent_confirmation: boolean;
+  has_result_conflict: boolean;
+  latest_schedule_proposal_id: string | null;
+  latest_schedule_proposal_proposed_by_team_id: string | null;
+  latest_schedule_proposal_proposed_by_team_name: string | null;
+  latest_schedule_proposal_proposed_start_at: string | null;
+  latest_schedule_proposal_status: MatchScheduleProposalStatus | null;
+  latest_schedule_proposal_responded_by_team_id: string | null;
+}
+
 export interface CreateEventInput {
   title: string;
   game: string;
@@ -38,18 +67,26 @@ export class EventTeamAlreadyRegisteredError extends Error {}
 export class EventManageForbiddenError extends Error {}
 export class EventStartStateError extends Error {}
 export class EventInsufficientTeamsError extends Error {}
+export class EventMatchNotFoundError extends Error {}
+export class EventMatchForbiddenError extends Error {}
+export class EventMatchStateError extends Error {}
+export class EventMatchScheduleProposalNotFoundError extends Error {}
 
 export async function getCurrentEventForUser(
   pool: Pool,
   userId: string,
   isAdmin: boolean
-): Promise<{ team: TeamSummary | null; currentEvent: EventRow | null }> {
+): Promise<{ team: TeamSummary | null; currentEvent: EventRow | null; matches: EventMatchRow[] }> {
   const team = await getTeamSummaryForUser(pool, userId);
   const currentEvent = await queryCurrentEventRow(pool, team?.id ?? null, isAdmin);
+  const matches = currentEvent
+    ? await queryCurrentEventMatches(pool, currentEvent.id, team?.id ?? null, team?.your_role ?? null, isAdmin)
+    : [];
 
   return {
     team,
-    currentEvent
+    currentEvent,
+    matches
   };
 }
 
@@ -364,6 +401,385 @@ export async function startCurrentEvent(
   }
 }
 
+export async function updateCurrentEventMatchStatus(
+  pool: Pool,
+  matchId: string,
+  targetStatus: "scheduled" | "in_progress",
+  isAdmin: boolean
+): Promise<void> {
+  if (!isAdmin) {
+    throw new EventMatchForbiddenError("Only the admin account can manage match lifecycle");
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const match = await queryMatchForUpdate(client, matchId);
+    if (!match) {
+      throw new EventMatchNotFoundError("Match not found");
+    }
+
+    if (!match.team_a_id || !match.team_b_id) {
+      throw new EventMatchStateError("Cannot transition bye matches manually");
+    }
+
+    const transitionAllowed =
+      ((match.status === "pending" || match.status === "scheduling") && targetStatus === "scheduled") ||
+      (match.status === "scheduled" && targetStatus === "in_progress");
+
+    if (!transitionAllowed) {
+      throw new EventMatchStateError("Invalid match status transition");
+    }
+
+    await client.query(
+      `
+        UPDATE event_matches
+        SET status = $2, updated_at = NOW()
+        WHERE id = $1
+      `,
+      [matchId, targetStatus]
+    );
+
+    await client.query("COMMIT");
+  } catch (error: unknown) {
+    await client.query("ROLLBACK");
+    if (
+      error instanceof EventMatchForbiddenError ||
+      error instanceof EventMatchNotFoundError ||
+      error instanceof EventMatchStateError
+    ) {
+      throw error;
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function proposeCurrentEventMatchSchedule(
+  pool: Pool,
+  matchId: string,
+  proposedStartAtIso: string,
+  userId: string
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const match = await queryMatchForUpdate(client, matchId);
+    if (!match) {
+      throw new EventMatchNotFoundError("Match not found");
+    }
+
+    if (!match.team_a_id || !match.team_b_id) {
+      throw new EventMatchStateError("Cannot schedule bye matches");
+    }
+
+    if (match.status !== "pending" && match.status !== "scheduling") {
+      throw new EventMatchStateError("Match is not in a schedulable state");
+    }
+
+    const membership = await queryUserTeamMembership(client, userId);
+    if (!membership || membership.role !== "admin") {
+      throw new EventMatchForbiddenError("Only team admins can propose match times");
+    }
+
+    if (membership.team_id !== match.team_a_id && membership.team_id !== match.team_b_id) {
+      throw new EventMatchForbiddenError("Only participating teams can propose match times");
+    }
+
+    await client.query(
+      `
+        INSERT INTO event_match_schedule_proposals (
+          match_id,
+          proposed_by_team_id,
+          proposed_start_at,
+          status
+        )
+        VALUES ($1, $2, $3, 'pending')
+      `,
+      [matchId, membership.team_id, proposedStartAtIso]
+    );
+
+    await client.query(
+      `
+        UPDATE event_matches
+        SET status = 'scheduling',
+            updated_at = NOW()
+        WHERE id = $1
+          AND status = 'pending'
+      `,
+      [matchId]
+    );
+
+    await client.query("COMMIT");
+  } catch (error: unknown) {
+    await client.query("ROLLBACK");
+    if (
+      error instanceof EventMatchNotFoundError ||
+      error instanceof EventMatchForbiddenError ||
+      error instanceof EventMatchStateError
+    ) {
+      throw error;
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function respondToCurrentEventMatchSchedule(
+  pool: Pool,
+  matchId: string,
+  proposalId: string,
+  decision: "accept" | "reject",
+  userId: string
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const match = await queryMatchForUpdate(client, matchId);
+    if (!match) {
+      throw new EventMatchNotFoundError("Match not found");
+    }
+
+    if (!match.team_a_id || !match.team_b_id) {
+      throw new EventMatchStateError("Cannot schedule bye matches");
+    }
+
+    const membership = await queryUserTeamMembership(client, userId);
+    if (!membership || membership.role !== "admin") {
+      throw new EventMatchForbiddenError("Only team admins can respond to match schedules");
+    }
+
+    if (membership.team_id !== match.team_a_id && membership.team_id !== match.team_b_id) {
+      throw new EventMatchForbiddenError("Only participating teams can respond to match schedules");
+    }
+
+    const proposal = await queryPendingScheduleProposalForUpdate(client, matchId, proposalId);
+    if (!proposal) {
+      throw new EventMatchScheduleProposalNotFoundError("Schedule proposal not found");
+    }
+
+    if (proposal.proposed_by_team_id === membership.team_id) {
+      throw new EventMatchForbiddenError("Proposing team cannot respond to its own proposal");
+    }
+
+    const nextStatus = decision === "accept" ? "accepted" : "rejected";
+    await client.query(
+      `
+        UPDATE event_match_schedule_proposals
+        SET status = $3,
+            responded_by_team_id = $4,
+            responded_at = NOW()
+        WHERE id = $1
+          AND match_id = $2
+      `,
+      [proposalId, matchId, nextStatus, membership.team_id]
+    );
+
+    if (decision === "accept") {
+      await client.query(
+        `
+          UPDATE event_match_schedule_proposals
+          SET status = 'rejected',
+              responded_by_team_id = $2,
+              responded_at = NOW()
+          WHERE match_id = $1
+            AND id <> $3
+            AND status = 'pending'
+        `,
+        [matchId, membership.team_id, proposalId]
+      );
+
+      await client.query(
+        `
+          UPDATE event_matches
+          SET status = 'scheduled',
+              scheduled_start_at = $2,
+              updated_at = NOW()
+          WHERE id = $1
+        `,
+        [matchId, proposal.proposed_start_at]
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (error: unknown) {
+    await client.query("ROLLBACK");
+    if (
+      error instanceof EventMatchNotFoundError ||
+      error instanceof EventMatchForbiddenError ||
+      error instanceof EventMatchStateError ||
+      error instanceof EventMatchScheduleProposalNotFoundError
+    ) {
+      throw error;
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+export async function reportCurrentEventMatchResult(
+  pool: Pool,
+  matchId: string,
+  winnerTeamId: string,
+  userId: string,
+  isAdmin: boolean,
+  adminOverride: boolean
+): Promise<{ finalized: boolean; awaitingOpponent: boolean; conflict: boolean }> {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const match = await queryMatchForUpdate(client, matchId);
+    if (!match) {
+      throw new EventMatchNotFoundError("Match not found");
+    }
+
+    if (!match.team_a_id || !match.team_b_id) {
+      throw new EventMatchStateError("Cannot report results for bye matches");
+    }
+
+    const allowedWinnerIds = [match.team_a_id, match.team_b_id];
+    if (!allowedWinnerIds.includes(winnerTeamId)) {
+      throw new EventMatchStateError("Reported winner must be a participating team");
+    }
+
+    if (adminOverride) {
+      if (!isAdmin) {
+        throw new EventMatchForbiddenError("Only the admin account can override match results");
+      }
+
+      await client.query(
+        `
+          INSERT INTO event_match_reports (
+            match_id,
+            reporter_user_id,
+            reporter_team_id,
+            reported_winner_team_id,
+            is_admin_override
+          )
+          VALUES ($1, $2, NULL, $3, true)
+          ON CONFLICT (match_id)
+          WHERE is_admin_override = true
+          DO UPDATE SET
+            reporter_user_id = EXCLUDED.reporter_user_id,
+            reported_winner_team_id = EXCLUDED.reported_winner_team_id,
+            updated_at = NOW()
+        `,
+        [matchId, userId, winnerTeamId]
+      );
+
+      await client.query(
+        `
+          UPDATE event_matches
+          SET winner_team_id = $2,
+              status = 'completed',
+              updated_at = NOW()
+          WHERE id = $1
+        `,
+        [matchId, winnerTeamId]
+      );
+
+      await client.query("COMMIT");
+      return { finalized: true, awaitingOpponent: false, conflict: false };
+    }
+
+    if (match.status !== "in_progress") {
+      throw new EventMatchStateError("Match must be in progress before reporting a result");
+    }
+
+    const membership = await queryUserTeamMembership(client, userId);
+    if (!membership || membership.role !== "admin") {
+      throw new EventMatchForbiddenError("Only team admins can report match results");
+    }
+
+    if (membership.team_id !== match.team_a_id && membership.team_id !== match.team_b_id) {
+      throw new EventMatchForbiddenError("Only participating teams can report match results");
+    }
+
+    await client.query(
+      `
+        INSERT INTO event_match_reports (
+          match_id,
+          reporter_user_id,
+          reporter_team_id,
+          reported_winner_team_id,
+          is_admin_override
+        )
+        VALUES ($1, $2, $3, $4, false)
+        ON CONFLICT (match_id, reporter_team_id)
+        DO UPDATE SET
+          reporter_user_id = EXCLUDED.reporter_user_id,
+          reported_winner_team_id = EXCLUDED.reported_winner_team_id,
+          is_admin_override = false,
+          updated_at = NOW()
+      `,
+      [matchId, userId, membership.team_id, winnerTeamId]
+    );
+
+    const reportsResult = await client.query<{
+      reporter_team_id: string;
+      reported_winner_team_id: string;
+    }>(
+      `
+        SELECT reporter_team_id, reported_winner_team_id
+        FROM event_match_reports
+        WHERE match_id = $1
+          AND is_admin_override = false
+      `,
+      [matchId]
+    );
+
+    const reportByTeam = new Map<string, string>();
+    for (const row of reportsResult.rows) {
+      reportByTeam.set(row.reporter_team_id, row.reported_winner_team_id);
+    }
+
+    const teamAReport = reportByTeam.get(match.team_a_id) ?? null;
+    const teamBReport = reportByTeam.get(match.team_b_id) ?? null;
+
+    if (teamAReport && teamBReport && teamAReport === teamBReport) {
+      await client.query(
+        `
+          UPDATE event_matches
+          SET winner_team_id = $2,
+              status = 'completed',
+              updated_at = NOW()
+          WHERE id = $1
+        `,
+        [matchId, teamAReport]
+      );
+
+      await client.query("COMMIT");
+      return { finalized: true, awaitingOpponent: false, conflict: false };
+    }
+
+    await client.query("COMMIT");
+    return {
+      finalized: false,
+      awaitingOpponent: !(teamAReport && teamBReport),
+      conflict: Boolean(teamAReport && teamBReport && teamAReport !== teamBReport)
+    };
+  } catch (error: unknown) {
+    await client.query("ROLLBACK");
+    if (
+      error instanceof EventMatchNotFoundError ||
+      error instanceof EventMatchForbiddenError ||
+      error instanceof EventMatchStateError
+    ) {
+      throw error;
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 async function queryCurrentEventRow(
   poolLike: Pool | PoolClient,
   teamId: string | null,
@@ -420,6 +836,179 @@ async function queryCurrentEventRow(
       LIMIT 1
     `,
     [teamId, isAdmin]
+  );
+
+  return result.rows[0] ?? null;
+}
+
+async function queryCurrentEventMatches(
+  poolLike: Pool | PoolClient,
+  eventId: string,
+  teamId: string | null,
+  teamRole: "admin" | "member" | null,
+  isAdmin: boolean
+): Promise<EventMatchRow[]> {
+  const result = await poolLike.query<EventMatchRow>(
+    `
+      SELECT
+        em.id,
+        em.round_number,
+        em.slot_number,
+        em.status,
+        em.team_a_id,
+        team_a.name AS team_a_name,
+        em.team_b_id,
+        team_b.name AS team_b_name,
+        em.scheduled_start_at,
+        em.winner_team_id,
+        ($3::boolean) AS can_manage_lifecycle,
+        ($3::boolean AND em.status IN ('pending', 'scheduling') AND em.team_a_id IS NOT NULL AND em.team_b_id IS NOT NULL)
+          AS can_transition_to_scheduled,
+        ($3::boolean AND em.status = 'scheduled' AND em.team_a_id IS NOT NULL AND em.team_b_id IS NOT NULL)
+          AS can_transition_to_in_progress,
+        (
+          $1::uuid IS NOT NULL
+          AND $2::text = 'admin'
+          AND em.status IN ('pending', 'scheduling')
+          AND ($1::uuid = em.team_a_id OR $1::uuid = em.team_b_id)
+        ) AS can_propose_schedule,
+        (
+          $1::uuid IS NOT NULL
+          AND $2::text = 'admin'
+          AND pending_schedule.id IS NOT NULL
+          AND pending_schedule.proposed_by_team_id <> $1::uuid
+          AND ($1::uuid = em.team_a_id OR $1::uuid = em.team_b_id)
+        ) AS can_respond_to_schedule_proposal,
+        (
+          $1::uuid IS NOT NULL
+          AND $2::text = 'admin'
+          AND em.status = 'in_progress'
+          AND ($1::uuid = em.team_a_id OR $1::uuid = em.team_b_id)
+        ) AS can_report_result,
+        your_report.reported_winner_team_id AS your_reported_winner_team_id,
+        (
+          your_report.reported_winner_team_id IS NOT NULL
+          AND opponent_report.reported_winner_team_id IS NULL
+        ) AS is_awaiting_opponent_confirmation,
+        (
+          your_report.reported_winner_team_id IS NOT NULL
+          AND opponent_report.reported_winner_team_id IS NOT NULL
+          AND your_report.reported_winner_team_id <> opponent_report.reported_winner_team_id
+        ) AS has_result_conflict,
+        latest_schedule.id AS latest_schedule_proposal_id,
+        latest_schedule.proposed_by_team_id AS latest_schedule_proposal_proposed_by_team_id,
+        latest_proposer.name AS latest_schedule_proposal_proposed_by_team_name,
+        latest_schedule.proposed_start_at AS latest_schedule_proposal_proposed_start_at,
+        latest_schedule.status AS latest_schedule_proposal_status,
+        latest_schedule.responded_by_team_id AS latest_schedule_proposal_responded_by_team_id
+      FROM event_matches em
+      LEFT JOIN teams team_a ON team_a.id = em.team_a_id
+      LEFT JOIN teams team_b ON team_b.id = em.team_b_id
+      LEFT JOIN LATERAL (
+        SELECT id, proposed_by_team_id, proposed_start_at, status, responded_by_team_id
+        FROM event_match_schedule_proposals
+        WHERE match_id = em.id
+        ORDER BY created_at DESC
+        LIMIT 1
+      ) latest_schedule ON true
+      LEFT JOIN teams latest_proposer ON latest_proposer.id = latest_schedule.proposed_by_team_id
+      LEFT JOIN LATERAL (
+        SELECT id, proposed_by_team_id
+        FROM event_match_schedule_proposals
+        WHERE match_id = em.id
+          AND status = 'pending'
+        ORDER BY created_at DESC
+        LIMIT 1
+      ) pending_schedule ON true
+      LEFT JOIN LATERAL (
+        SELECT reported_winner_team_id
+        FROM event_match_reports
+        WHERE match_id = em.id
+          AND reporter_team_id = $1
+          AND is_admin_override = false
+        LIMIT 1
+      ) your_report ON true
+      LEFT JOIN LATERAL (
+        SELECT reported_winner_team_id
+        FROM event_match_reports
+        WHERE match_id = em.id
+          AND reporter_team_id IS NOT NULL
+          AND reporter_team_id <> $1
+          AND is_admin_override = false
+        LIMIT 1
+      ) opponent_report ON true
+      WHERE em.event_id = $4
+      ORDER BY em.round_number ASC, em.slot_number ASC
+    `,
+    [teamId, teamRole, isAdmin, eventId]
+  );
+
+  return result.rows;
+}
+
+async function queryMatchForUpdate(
+  client: PoolClient,
+  matchId: string
+): Promise<{
+  id: string;
+  status: MatchStatus;
+  team_a_id: string | null;
+  team_b_id: string | null;
+} | null> {
+  const result = await client.query<{
+    id: string;
+    status: MatchStatus;
+    team_a_id: string | null;
+    team_b_id: string | null;
+  }>(
+    `
+      SELECT em.id, em.status, em.team_a_id, em.team_b_id
+      FROM event_matches em
+      INNER JOIN events e ON e.id = em.event_id
+      WHERE em.id = $1
+        AND e.status <> 'completed'
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [matchId]
+  );
+
+  return result.rows[0] ?? null;
+}
+
+async function queryUserTeamMembership(
+  client: PoolClient,
+  userId: string
+): Promise<{ team_id: string; role: "admin" | "member" } | null> {
+  const result = await client.query<{ team_id: string; role: "admin" | "member" }>(
+    `
+      SELECT team_id, role
+      FROM team_members
+      WHERE user_id = $1
+      LIMIT 1
+    `,
+    [userId]
+  );
+
+  return result.rows[0] ?? null;
+}
+
+async function queryPendingScheduleProposalForUpdate(
+  client: PoolClient,
+  matchId: string,
+  proposalId: string
+): Promise<{ proposed_by_team_id: string; proposed_start_at: string } | null> {
+  const result = await client.query<{ proposed_by_team_id: string; proposed_start_at: string }>(
+    `
+      SELECT proposed_by_team_id, proposed_start_at
+      FROM event_match_schedule_proposals
+      WHERE id = $1
+        AND match_id = $2
+        AND status = 'pending'
+      LIMIT 1
+      FOR UPDATE
+    `,
+    [proposalId, matchId]
   );
 
   return result.rows[0] ?? null;

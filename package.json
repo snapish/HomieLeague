@@ -9,6 +9,7 @@
   "scripts": {
     "build": "npm run build -w @homieleague/shared && npm run build -w @homieleague/api && npm run build -w @homieleague/web",
     "lint": "npm run lint --workspaces --if-present",
+    "test": "npm run test -w @homieleague/api",
     "typecheck": "npm run build -w @homieleague/shared && npm run typecheck -w @homieleague/api && npm run typecheck -w @homieleague/web",
     "dev:web": "npm run dev -w @homieleague/web",
     "dev:api": "npm run dev -w @homieleague/api"

@@ -17,11 +17,19 @@ import type {
   JoinTeamRequest,
   LoginRequest,
   EventSummary,
+  EventMatchSummary,
   CreateEventResponse,
   RegisterCurrentEventRequest,
   RegisterEventResponse,
+  ProposeMatchScheduleRequest,
+  RespondMatchScheduleRequest,
+  UpdateMatchStatusRequest,
+  ReportMatchResultRequest,
   PlayerDashboardResponse,
   PlayerTeamSummary,
+  NotificationsResponse,
+  NotificationSummary,
+  MarkNotificationsReadResponse,
   RemoveTeamMemberRequest,
   TeamActionSuccessResponse,
   TransferTeamAdminRequest,
@@ -60,6 +68,10 @@ import {
   completeCurrentEvent,
   createCurrentEvent,
   EventInsufficientTeamsError,
+  EventMatchForbiddenError,
+  EventMatchNotFoundError,
+  EventMatchScheduleProposalNotFoundError,
+  EventMatchStateError,
   EventManageForbiddenError,
   EventNotFoundError,
   EventRegistrationClosedError,
@@ -67,11 +79,27 @@ import {
   EventTeamAlreadyRegisteredError,
   EventTeamNotEligibleError,
   EventTeamNotReadyError,
+  proposeCurrentEventMatchSchedule,
+  reportCurrentEventMatchResult,
+  respondToCurrentEventMatchSchedule,
   startCurrentEvent,
+  updateCurrentEventMatchStatus,
+  type EventMatchRow,
   type EventRow,
   getCurrentEventForUser,
   registerCurrentTeamForCurrentEvent
 } from "./db/eventRepository.js";
+import {
+  createMatchCreatedNotifications,
+  createResultDisputedNotifications,
+  createResultOverrideNotifications,
+  createScheduleAcceptedNotifications,
+  createScheduleProposedNotifications,
+  createTeamInviteNotifications,
+  listNotificationsForUser,
+  markNotificationsRead,
+  type NotificationRow
+} from "./db/notificationRepository.js";
 import {
   generateSessionToken,
   hashPassword,
@@ -159,6 +187,47 @@ const startCurrentEventSchema = z
     confirm: z.literal(true)
   })
   .strict();
+
+const updateMatchStatusSchema = z
+  .object({
+    status: z.enum(["scheduled", "in_progress"])
+  })
+  .strict();
+
+const reportMatchResultSchema = z
+  .object({
+    winnerTeamId: z.string().uuid(),
+    adminOverride: z.boolean().optional()
+  })
+  .strict();
+
+const proposeMatchScheduleSchema = z
+  .object({
+    proposedStartAt: z.string().datetime({ offset: true })
+  })
+  .strict();
+
+const respondMatchScheduleSchema = z
+  .object({
+    proposalId: z.string().uuid(),
+    decision: z.enum(["accept", "reject"])
+  })
+  .strict();
+
+const markNotificationsReadSchema = z
+  .object({
+    markAll: z.boolean().optional(),
+    notificationIds: z.array(z.string().uuid()).min(1).optional()
+  })
+  .strict()
+  .superRefine((value, context) => {
+    if (value.markAll !== true && (!value.notificationIds || value.notificationIds.length === 0)) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Provide markAll=true or at least one notificationId"
+      });
+    }
+  });
 
 app.disable("x-powered-by");
 app.use(helmet());
@@ -473,6 +542,13 @@ app.post("/api/player/team/join", async (req, res) => {
     const pool = getDbPool();
     const teamSummary = await joinTeamByInviteCode(pool, sessionUser.user_id, request.inviteCode);
     const team = requireTeamSummary(teamSummary);
+    await createTeamInviteNotifications(
+      pool,
+      team.id,
+      sessionUser.user_id,
+      sessionUser.username,
+      team.name
+    );
 
     res.status(200).json({
       ok: true,
@@ -813,7 +889,8 @@ app.get("/api/events", async (req, res) => {
       ok: true,
       message: "Current event loaded",
       team: mapTeamSummary(result.team),
-      currentEvent: result.currentEvent ? mapEventRow(result.currentEvent) : null
+      currentEvent: result.currentEvent ? mapEventRow(result.currentEvent) : null,
+      matches: result.matches.map(mapEventMatchRow)
     };
 
     res.status(200).json(payload);
@@ -1031,8 +1108,12 @@ app.post("/api/events/current/start", async (req, res) => {
       ok: true,
       message: `Current event started. ${result.createdMatches} first-round match${result.createdMatches === 1 ? "" : "es"} created.`,
       currentEvent: refreshed.currentEvent ? mapEventRow(refreshed.currentEvent) : null,
-      createdMatches: result.createdMatches
+      createdMatches: result.createdMatches,
+      matches: refreshed.matches.map(mapEventMatchRow)
     };
+    if (refreshed.currentEvent) {
+      await createMatchCreatedNotifications(pool, refreshed.currentEvent.id, refreshed.currentEvent.title);
+    }
     res.status(200).json(payload);
   } catch (error: unknown) {
     if (error instanceof EventNotFoundError) {
@@ -1074,6 +1155,414 @@ app.post("/api/events/current/start", async (req, res) => {
     const payload: ApiErrorResponse = {
       ok: false,
       message: "Unable to start current event"
+    };
+    res.status(500).json(payload);
+  }
+});
+
+app.post("/api/events/matches/:matchId/schedule/propose", async (req, res) => {
+  const parsed = proposeMatchScheduleSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Invalid schedule proposal payload",
+      issues: parsed.error.issues.map((issue) => issue.path.join(".") || issue.message)
+    };
+    res.status(400).json(payload);
+    return;
+  }
+
+  const matchIdResult = z.string().uuid().safeParse(req.params.matchId);
+  if (!matchIdResult.success) {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Invalid match id"
+    };
+    res.status(400).json(payload);
+    return;
+  }
+
+  try {
+    const sessionUser = await requireSessionUser(req.header("authorization"));
+    if (!sessionUser) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Invalid or expired session"
+      };
+      res.status(401).json(payload);
+      return;
+    }
+
+    const request: ProposeMatchScheduleRequest = parsed.data;
+    const pool = getDbPool();
+    await proposeCurrentEventMatchSchedule(
+      pool,
+      matchIdResult.data,
+      request.proposedStartAt,
+      sessionUser.user_id
+    );
+    const postProposalEvent = await getCurrentEventForUser(pool, sessionUser.user_id, sessionUser.isAdmin);
+    const proposedMatch = postProposalEvent.matches.find((match) => match.id === matchIdResult.data);
+    if (
+      proposedMatch?.latest_schedule_proposal_proposed_by_team_id &&
+      proposedMatch.latest_schedule_proposal_proposed_start_at
+    ) {
+      await createScheduleProposedNotifications(
+        pool,
+        matchIdResult.data,
+        proposedMatch.latest_schedule_proposal_proposed_by_team_id,
+        proposedMatch.latest_schedule_proposal_proposed_start_at
+      );
+    }
+
+    const refreshed = await getCurrentEventForUser(pool, sessionUser.user_id, sessionUser.isAdmin);
+    const payload: CurrentEventResponse = {
+      ok: true,
+      message: "Schedule proposal submitted",
+      team: mapTeamSummary(refreshed.team),
+      currentEvent: refreshed.currentEvent ? mapEventRow(refreshed.currentEvent) : null,
+      matches: refreshed.matches.map(mapEventMatchRow)
+    };
+    res.status(200).json(payload);
+  } catch (error: unknown) {
+    if (error instanceof EventMatchNotFoundError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Match not found"
+      };
+      res.status(404).json(payload);
+      return;
+    }
+
+    if (error instanceof EventMatchForbiddenError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Only participating team admins can propose schedules"
+      };
+      res.status(403).json(payload);
+      return;
+    }
+
+    if (error instanceof EventMatchStateError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: error.message
+      };
+      res.status(409).json(payload);
+      return;
+    }
+
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Unable to submit schedule proposal"
+    };
+    res.status(500).json(payload);
+  }
+});
+
+app.post("/api/events/matches/:matchId/schedule/respond", async (req, res) => {
+  const parsed = respondMatchScheduleSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Invalid schedule response payload",
+      issues: parsed.error.issues.map((issue) => issue.path.join(".") || issue.message)
+    };
+    res.status(400).json(payload);
+    return;
+  }
+
+  const matchIdResult = z.string().uuid().safeParse(req.params.matchId);
+  if (!matchIdResult.success) {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Invalid match id"
+    };
+    res.status(400).json(payload);
+    return;
+  }
+
+  try {
+    const sessionUser = await requireSessionUser(req.header("authorization"));
+    if (!sessionUser) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Invalid or expired session"
+      };
+      res.status(401).json(payload);
+      return;
+    }
+
+    const request: RespondMatchScheduleRequest = parsed.data;
+    const pool = getDbPool();
+    await respondToCurrentEventMatchSchedule(
+      pool,
+      matchIdResult.data,
+      request.proposalId,
+      request.decision,
+      sessionUser.user_id
+    );
+    if (request.decision === "accept") {
+      const postResponseEvent = await getCurrentEventForUser(pool, sessionUser.user_id, sessionUser.isAdmin);
+      const acceptedMatch = postResponseEvent.matches.find((match) => match.id === matchIdResult.data);
+      if (
+        acceptedMatch?.latest_schedule_proposal_proposed_by_team_id &&
+        acceptedMatch.latest_schedule_proposal_proposed_start_at
+      ) {
+        await createScheduleAcceptedNotifications(
+          pool,
+          matchIdResult.data,
+          acceptedMatch.latest_schedule_proposal_proposed_by_team_id,
+          acceptedMatch.latest_schedule_proposal_proposed_start_at
+        );
+      }
+    }
+
+    const refreshed = await getCurrentEventForUser(pool, sessionUser.user_id, sessionUser.isAdmin);
+    const payload: CurrentEventResponse = {
+      ok: true,
+      message: request.decision === "accept" ? "Schedule accepted" : "Schedule rejected",
+      team: mapTeamSummary(refreshed.team),
+      currentEvent: refreshed.currentEvent ? mapEventRow(refreshed.currentEvent) : null,
+      matches: refreshed.matches.map(mapEventMatchRow)
+    };
+    res.status(200).json(payload);
+  } catch (error: unknown) {
+    if (error instanceof EventMatchNotFoundError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Match not found"
+      };
+      res.status(404).json(payload);
+      return;
+    }
+
+    if (error instanceof EventMatchScheduleProposalNotFoundError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Schedule proposal not found or already resolved"
+      };
+      res.status(404).json(payload);
+      return;
+    }
+
+    if (error instanceof EventMatchForbiddenError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Only the opposing participating team admin can respond"
+      };
+      res.status(403).json(payload);
+      return;
+    }
+
+    if (error instanceof EventMatchStateError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: error.message
+      };
+      res.status(409).json(payload);
+      return;
+    }
+
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Unable to respond to schedule proposal"
+    };
+    res.status(500).json(payload);
+  }
+});
+
+app.post("/api/events/matches/:matchId/status", async (req, res) => {
+  const parsed = updateMatchStatusSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Invalid match status payload",
+      issues: parsed.error.issues.map((issue) => issue.path.join(".") || issue.message)
+    };
+    res.status(400).json(payload);
+    return;
+  }
+
+  const matchIdResult = z.string().uuid().safeParse(req.params.matchId);
+  if (!matchIdResult.success) {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Invalid match id"
+    };
+    res.status(400).json(payload);
+    return;
+  }
+
+  try {
+    const adminGuard = await requireAdminSessionUser(req.header("authorization"));
+    if (!adminGuard.ok) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: adminGuard.message
+      };
+      res.status(adminGuard.status).json(payload);
+      return;
+    }
+
+    const request: UpdateMatchStatusRequest = parsed.data;
+    const pool = getDbPool();
+    await updateCurrentEventMatchStatus(
+      pool,
+      matchIdResult.data,
+      request.status,
+      adminGuard.sessionUser.isAdmin
+    );
+
+    const refreshed = await getCurrentEventForUser(
+      pool,
+      adminGuard.sessionUser.user_id,
+      adminGuard.sessionUser.isAdmin
+    );
+
+    const payload: CurrentEventResponse = {
+      ok: true,
+      message: `Match moved to ${request.status}`,
+      team: mapTeamSummary(refreshed.team),
+      currentEvent: refreshed.currentEvent ? mapEventRow(refreshed.currentEvent) : null,
+      matches: refreshed.matches.map(mapEventMatchRow)
+    };
+    res.status(200).json(payload);
+  } catch (error: unknown) {
+    if (error instanceof EventMatchNotFoundError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Match not found"
+      };
+      res.status(404).json(payload);
+      return;
+    }
+
+    if (error instanceof EventMatchForbiddenError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Only the admin account can manage match lifecycle"
+      };
+      res.status(403).json(payload);
+      return;
+    }
+
+    if (error instanceof EventMatchStateError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Invalid match state transition"
+      };
+      res.status(409).json(payload);
+      return;
+    }
+
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Unable to update match status"
+    };
+    res.status(500).json(payload);
+  }
+});
+
+app.post("/api/events/matches/:matchId/result", async (req, res) => {
+  const parsed = reportMatchResultSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Invalid match result payload",
+      issues: parsed.error.issues.map((issue) => issue.path.join(".") || issue.message)
+    };
+    res.status(400).json(payload);
+    return;
+  }
+
+  const matchIdResult = z.string().uuid().safeParse(req.params.matchId);
+  if (!matchIdResult.success) {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Invalid match id"
+    };
+    res.status(400).json(payload);
+    return;
+  }
+
+  try {
+    const sessionUser = await requireSessionUser(req.header("authorization"));
+    if (!sessionUser) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Invalid or expired session"
+      };
+      res.status(401).json(payload);
+      return;
+    }
+
+    const request = parsed.data;
+    const pool = getDbPool();
+    const outcome = await reportCurrentEventMatchResult(
+      pool,
+      matchIdResult.data,
+      request.winnerTeamId,
+      sessionUser.user_id,
+      sessionUser.isAdmin,
+      request.adminOverride === true
+    );
+
+    if (outcome.conflict) {
+      const adminUser = await findUserByIdentifier(pool, adminEmail);
+      await createResultDisputedNotifications(pool, matchIdResult.data, adminUser?.id ?? null);
+    }
+
+    if (request.adminOverride === true) {
+      await createResultOverrideNotifications(pool, matchIdResult.data, request.winnerTeamId);
+    }
+
+    const refreshed = await getCurrentEventForUser(pool, sessionUser.user_id, sessionUser.isAdmin);
+    const message = outcome.finalized
+      ? "Match result finalized"
+      : outcome.conflict
+        ? "Conflicting reports submitted. Admin override required to finalize."
+        : "Result submitted. Waiting for opponent confirmation.";
+
+    const payload: CurrentEventResponse = {
+      ok: true,
+      message,
+      team: mapTeamSummary(refreshed.team),
+      currentEvent: refreshed.currentEvent ? mapEventRow(refreshed.currentEvent) : null,
+      matches: refreshed.matches.map(mapEventMatchRow)
+    };
+    res.status(200).json(payload);
+  } catch (error: unknown) {
+    if (error instanceof EventMatchNotFoundError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Match not found"
+      };
+      res.status(404).json(payload);
+      return;
+    }
+
+    if (error instanceof EventMatchForbiddenError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "You are not allowed to report this match result"
+      };
+      res.status(403).json(payload);
+      return;
+    }
+
+    if (error instanceof EventMatchStateError) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: error.message
+      };
+      res.status(409).json(payload);
+      return;
+    }
+
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Unable to report match result"
     };
     res.status(500).json(payload);
   }
@@ -1123,7 +1612,8 @@ app.post("/api/events/current/complete", async (req, res) => {
     const payload: CompleteCurrentEventResponse = {
       ok: true,
       message: "Current event completed",
-      currentEvent: refreshed.currentEvent ? mapEventRow(refreshed.currentEvent) : null
+      currentEvent: refreshed.currentEvent ? mapEventRow(refreshed.currentEvent) : null,
+      matches: refreshed.matches.map(mapEventMatchRow)
     };
     res.status(200).json(payload);
   } catch (error: unknown) {
@@ -1148,6 +1638,83 @@ app.post("/api/events/current/complete", async (req, res) => {
     const payload: ApiErrorResponse = {
       ok: false,
       message: "Unable to complete current event"
+    };
+    res.status(500).json(payload);
+  }
+});
+
+app.get("/api/notifications", async (req, res) => {
+  try {
+    const sessionUser = await requireSessionUser(req.header("authorization"));
+    if (!sessionUser) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Invalid or expired session"
+      };
+      res.status(401).json(payload);
+      return;
+    }
+
+    const pool = getDbPool();
+    const result = await listNotificationsForUser(pool, sessionUser.user_id);
+    const payload: NotificationsResponse = {
+      ok: true,
+      message: "Notifications loaded",
+      notifications: result.notifications.map(mapNotificationRow),
+      unreadCount: result.unreadCount
+    };
+
+    res.status(200).json(payload);
+  } catch {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Unable to load notifications"
+    };
+    res.status(500).json(payload);
+  }
+});
+
+app.post("/api/notifications/read", async (req, res) => {
+  const parsed = markNotificationsReadSchema.safeParse(req.body);
+  if (!parsed.success) {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Invalid mark notifications payload",
+      issues: parsed.error.issues.map((issue) => issue.path.join(".") || issue.message)
+    };
+    res.status(400).json(payload);
+    return;
+  }
+
+  try {
+    const sessionUser = await requireSessionUser(req.header("authorization"));
+    if (!sessionUser) {
+      const payload: ApiErrorResponse = {
+        ok: false,
+        message: "Invalid or expired session"
+      };
+      res.status(401).json(payload);
+      return;
+    }
+
+    const request = parsed.data;
+    const pool = getDbPool();
+    const unreadCount = await markNotificationsRead(pool, sessionUser.user_id, {
+      markAll: request.markAll === true,
+      notificationIds: request.notificationIds ?? []
+    });
+
+    const payload: MarkNotificationsReadResponse = {
+      ok: true,
+      message: "Notifications updated",
+      unreadCount
+    };
+
+    res.status(200).json(payload);
+  } catch {
+    const payload: ApiErrorResponse = {
+      ok: false,
+      message: "Unable to update notifications"
     };
     res.status(500).json(payload);
   }
@@ -1281,6 +1848,56 @@ function mapEventRow(row: EventRow): EventSummary {
     canRegisterYourTeam: row.can_register_your_team,
     canManageCurrentEvent: row.can_manage_current_event,
     canStartCurrentEvent: row.can_start_current_event
+  };
+}
+
+function mapEventMatchRow(row: EventMatchRow): EventMatchSummary {
+  return {
+    id: row.id,
+    roundNumber: row.round_number,
+    slotNumber: row.slot_number,
+    status: row.status,
+    teamAId: row.team_a_id,
+    teamAName: row.team_a_name,
+    teamBId: row.team_b_id,
+    teamBName: row.team_b_name,
+    scheduledStartAt: row.scheduled_start_at,
+    winnerTeamId: row.winner_team_id,
+    canManageLifecycle: row.can_manage_lifecycle,
+    canTransitionToScheduled: row.can_transition_to_scheduled,
+    canTransitionToInProgress: row.can_transition_to_in_progress,
+    canProposeSchedule: row.can_propose_schedule,
+    canRespondToScheduleProposal: row.can_respond_to_schedule_proposal,
+    canReportResult: row.can_report_result,
+    yourReportedWinnerTeamId: row.your_reported_winner_team_id,
+    isAwaitingOpponentConfirmation: row.is_awaiting_opponent_confirmation,
+    hasResultConflict: row.has_result_conflict,
+    latestScheduleProposal:
+      row.latest_schedule_proposal_id &&
+      row.latest_schedule_proposal_proposed_by_team_id &&
+      row.latest_schedule_proposal_proposed_start_at &&
+      row.latest_schedule_proposal_status
+        ? {
+            id: row.latest_schedule_proposal_id,
+            proposedByTeamId: row.latest_schedule_proposal_proposed_by_team_id,
+            proposedByTeamName: row.latest_schedule_proposal_proposed_by_team_name,
+            proposedStartAt: row.latest_schedule_proposal_proposed_start_at,
+            status: row.latest_schedule_proposal_status,
+            respondedByTeamId: row.latest_schedule_proposal_responded_by_team_id
+          }
+        : null
+  };
+}
+
+function mapNotificationRow(row: NotificationRow): NotificationSummary {
+  return {
+    id: row.id,
+    kind: row.kind,
+    title: row.title,
+    message: row.message,
+    metadata: row.metadata,
+    readAt: row.read_at,
+    createdAt: row.created_at
   };
 }
 
